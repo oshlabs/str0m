@@ -68,10 +68,14 @@ pub fn bwe_changing_bandwidth() -> Result<(), RtcError> {
             description: "Wait for bad conditions stabilization",
             duration: Duration::from_secs(10),
         },
-        Step::Check {
-            // BWE should detect the reduced bandwidth and lower estimate
-            // Link is 1 Mbps, so estimate should be constrained to ~1 Mbps
-            description: "Bad conditions stabilized",
+        Step::CheckPeak {
+            // BWE should detect the reduced bandwidth and lower estimate.
+            // With inter-report drops now covered by TWCC feedback the
+            // estimate sawtooths honestly on this lossy link, so assert
+            // the peak of the phase rather than one sampled instant — and
+            // say so: a peak asserts recovery toward capacity, not
+            // stability.
+            description: "Estimate recovers toward the lossy link's capacity",
             at_least: Bitrate::kbps(400),
         },
         // Phase 3: Switch back to high bandwidth (10 Mbps)

@@ -319,12 +319,34 @@ impl TwccRecvRegister {
         let first = self.queue.get(self.report_from);
         let first = first?;
 
+        // The most recently reported receipt — kept in the queue for exactly
+        // this. Coverage continues from the seq after it, so packets dropped
+        // between two reports are encoded as missing instead of silently
+        // falling outside every report (the sender would then never count
+        // them as lost). On an absurd jump (restart, wrap weirdness), fall
+        // back to starting at the first received packet.
+        const MAX_LEADING_GAP: u64 = 4096;
+        let gap_anchor = self
+            .report_from
+            .checked_sub(1)
+            .and_then(|i| self.queue.get(i))
+            .filter(|p| *first.seq > *p.seq && *first.seq - *p.seq - 1 <= MAX_LEADING_GAP)
+            .map(|p| p.seq);
+
         // Set once on first ever built report.
         if self.time_start.is_none() {
             self.time_start = Some(first.time);
         }
 
-        let (base_seq, first_time) = (first.seq, first.time);
+        // The report covers seqs from base_seq; with a gap anchor the leading
+        // missing packets are part of the coverage. The reference time (and
+        // the first delta) still belongs to the first *received* packet —
+        // missing statuses carry no deltas.
+        let base_seq = match gap_anchor {
+            Some(prev) => TwccSeq::from(*prev + 1),
+            None => first.seq,
+        };
+        let first_time = first.time;
         let time_start = self.time_start.expect("a start time");
 
         // The difference between our Twcc reference time and the first ever report start time.
@@ -353,10 +375,13 @@ impl TwccRecvRegister {
 
         // The ChunkInterim are helpers structures that hold the deltas between
         // the registered receptions.
+        // The interim builder's anchor is the seq *before* the first covered
+        // status: the previously reported seq when continuing coverage, else
+        // the first received seq itself (which then starts the statuses).
         build_interims(
             &self.queue,
             self.report_from,
-            base_seq,
+            gap_anchor.unwrap_or(first.seq),
             base_time,
             &mut self.interims,
         );
@@ -1532,6 +1557,59 @@ mod test {
 
         assert_eq!(header, report.header());
         assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn consecutive_reports_cover_the_gap_between_reports() {
+        let now = Instant::now();
+
+        let mut recv = TwccRecvRegister::new(100);
+        let mut send = TwccSendRegister::new(25);
+        for i in 0..5 {
+            send.register_seq(TwccPacketId::new(i), now + Duration::from_millis(i), 0);
+        }
+
+        recv.update_seq(0.into(), now + Duration::from_millis(10));
+        recv.update_seq(1.into(), now + Duration::from_millis(20));
+        let report1 = recv.build_report(1000).unwrap();
+        assert_eq!(report1.base_seq, 0);
+        assert_eq!(report1.status_count, 2);
+
+        // Seqs 2 and 3 are dropped between the two reports: the second
+        // report's coverage must continue at 2, encoding them as missing —
+        // otherwise they fall outside every report and the sender can
+        // never count them as lost.
+        recv.update_seq(4.into(), now + Duration::from_millis(40));
+        let report2 = recv.build_report(1000).unwrap();
+        assert_eq!(
+            report2.base_seq, 2,
+            "coverage continues at the seq after the previous report"
+        );
+        assert_eq!(report2.status_count, 3, "two missing, one received");
+
+        // Round-trip the gap-covering report through the wire form.
+        let mut buf = vec![0_u8; 1500];
+        let n = report2.write_to(&mut buf[..]);
+        buf.truncate(n);
+        let parsed: Twcc = (&buf[4..]).try_into().unwrap();
+        assert_eq!(parsed, report2);
+
+        // The sender's register sees the drop.
+        let _ = send
+            .apply_report(report1, now + Duration::from_millis(50))
+            .expect("first report applies");
+        let records: Vec<_> = send
+            .apply_report(report2, now + Duration::from_millis(60))
+            .expect("second report applies")
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (*r.seq(), r.remote_recv_time().is_none()))
+                .collect::<Vec<_>>(),
+            vec![(2, true), (3, true), (4, false)],
+            "the packets dropped between the reports count as lost"
+        );
     }
 
     #[test]

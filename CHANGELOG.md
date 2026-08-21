@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Cover packets dropped between consecutive TWCC reports so the sender can count them as lost
   * Probe toward an unmet desired bitrate outside ALR so constant-rate senders can discover recovered capacity
   * Stop bounding loss controller candidates by the delay-based estimate, which deadlocked BWE recovery
   * Complete probe clusters at low bitrates and abandon clusters that cannot complete
