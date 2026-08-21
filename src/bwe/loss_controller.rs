@@ -82,12 +82,6 @@ pub struct LossController {
     /// HOLD mechanism state - prevents immediate ramp-up after loss
     last_hold_info: HoldInfo,
 
-    /// ALR start time (None if not in ALR)
-    alr_start_time: Option<Instant>,
-
-    /// Link capacity estimate from probes during ALR
-    link_capacity_estimate: Option<Bitrate>,
-
     /// Previous ALR state to detect transitions
     was_in_alr: bool,
 }
@@ -143,8 +137,6 @@ impl LossController {
 
             last_hold_info: HoldInfo::default(),
 
-            alr_start_time: None,
-            link_capacity_estimate: None,
             was_in_alr: false,
 
             config,
@@ -193,18 +185,7 @@ impl LossController {
             );
         }
 
-        self.alr_start_time = alr_start;
         self.was_in_alr = is_in_alr;
-    }
-
-    /// Set link capacity estimate from successful ALR probes.
-    pub fn set_link_capacity_estimate(&mut self, capacity: Option<Bitrate>) {
-        self.link_capacity_estimate = capacity;
-    }
-
-    /// Check if currently in ALR state
-    fn is_in_alr(&self) -> bool {
-        self.alr_start_time.is_some()
     }
 
     /// Reset all observations.
@@ -693,25 +674,23 @@ impl LossController {
     fn get_candidate_bandwidth_upper_bound(&self) -> Bitrate {
         let mut upper_bound = self.max_bitrate;
 
-        // When in ALR and we have a link capacity estimate from probes,
-        // use it as the upper bound. This prevents estimating beyond proven capacity.
-        if self.is_in_alr() {
-            if let Some(capacity) = self.link_capacity_estimate {
-                if capacity.is_valid() {
-                    upper_bound = upper_bound.min(capacity);
-                }
-            }
-        }
-
         if self.is_bandwidth_limited_due_to_loss()
             && self.bandwidth_limit_in_current_window.is_valid()
         {
             upper_bound = self.bandwidth_limit_in_current_window.min(upper_bound);
         }
 
-        upper_bound = self.get_instant_upper_bound().min(upper_bound);
-        if self.delay_based_estimate.is_valid() {
-            upper_bound = upper_bound.min(self.delay_based_estimate);
+        // WebRTC only bounds candidates by the instant upper bound and the
+        // delay-based estimate under trendline integration (disabled by
+        // default). Applying them unconditionally freezes recovery: while
+        // loss-limited the estimate sits below the delay-based estimate, no
+        // candidate may exceed it, so the controller can never re-enter the
+        // Increasing state that re-enables probing.
+        if self.config.trendline_integration_enabled {
+            upper_bound = self.get_instant_upper_bound().min(upper_bound);
+            if self.delay_based_estimate.is_valid() {
+                upper_bound = upper_bound.min(self.delay_based_estimate);
+            }
         }
 
         if !self.acknowledged_bitrate.is_valid() {
@@ -1125,6 +1104,40 @@ mod test {
         fn lost(&self) -> bool {
             self.lost
         }
+    }
+
+    #[test]
+    fn candidate_upper_bound_is_max_bitrate_when_not_loss_limited() {
+        // WebRTC only narrows the candidate upper bound below max_bitrate
+        // while in a loss-limited state (plus rampup acceleration). Bounding
+        // it by the delay-based estimate outside trendline integration means
+        // no candidate can ever exceed the current delay-based estimate, so
+        // an estimate that dipped below it cannot produce an increasing
+        // candidate and recovery stalls in the Decreasing state.
+        let mut lbc = LossController::new();
+        lbc.set_min_bitrate(Bitrate::from(50_000)); // 50 kbps
+        lbc.set_max_bitrate(Bitrate::from(1_000_000_000)); // 1 Gbps
+
+        lbc.set_acknowledged_bitrate(Bitrate::from(250_000));
+        lbc.set_bandwidth_estimate(Bitrate::from(300_000));
+
+        let mut pkt_builder = PacketBuilder::new(Instant::now()).num_packets(26);
+
+        // A loss-free observation with a valid delay-based estimate well
+        // below max_bitrate.
+        let result = pkt_builder.build_packets();
+        lbc.update_bandwidth_estimate(&result, Bitrate::bps(458_000));
+
+        assert_eq!(
+            lbc.loss_based_result().state,
+            LossControllerState::DelayBased
+        );
+        assert_eq!(
+            lbc.get_candidate_bandwidth_upper_bound(),
+            Bitrate::from(1_000_000_000),
+            "Outside a loss-limited state candidates are bounded by max_bitrate, \
+             not by the delay-based estimate"
+        );
     }
 
     #[test]
