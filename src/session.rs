@@ -369,6 +369,12 @@ impl Session {
         if let Some(cluster_id) = self.pacer.check_probe_complete(now) {
             bwe.end_probe(now, cluster_id);
         }
+
+        // A cluster that cannot complete is abandoned so it doesn't wedge the
+        // pacer in probe mode or leave the probe controller waiting forever.
+        if let Some(cluster_id) = self.pacer.check_probe_timeout(now) {
+            bwe.probe_timed_out(now, cluster_id);
+        }
     }
 
     fn update_queue_state(&mut self, now: Instant) {

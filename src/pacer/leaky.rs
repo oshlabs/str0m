@@ -214,6 +214,27 @@ impl LeakyBucketPacer {
         self.check_probe_complete_internal(now)
     }
 
+    /// Check if the active probe has been going on for too long to ever produce a
+    /// valid estimate, and if so abandon it.
+    ///
+    /// Probes are only dequeued on completion, so a cluster that cannot complete
+    /// (e.g. padding generation starved) would otherwise occupy the probe queue
+    /// forever, pinning the pacer's adjusted bitrate to the probe target. The
+    /// returned cluster ID lets the caller tell the probe controller the cluster
+    /// failed, so it doesn't wait for an answer that never comes.
+    pub(crate) fn check_probe_timeout(&mut self, now: Instant) -> Option<TwccClusterId> {
+        let probe = self.probe_queue.front()?;
+
+        if probe.is_complete(now) || !probe.is_timed_out(now) {
+            return None;
+        }
+
+        let cluster_id = probe.config().cluster();
+        trace!(?cluster_id, "Probe cluster timed out");
+        self.probe_queue.pop_front();
+        Some(cluster_id)
+    }
+
     /// Internal method to check if probe is complete (doesn't consume completed_probe)
     fn check_probe_complete_internal(&mut self, now: Instant) -> Option<TwccClusterId> {
         let probe = self.probe_queue.front()?;
@@ -871,6 +892,34 @@ mod test {
             total_rate={total_rate}, media_rate={media_rate}, padding_rate={padding_rate}, \
             config={config:?}, lower_bound={lower_bound}, upper_bound={upper_bound}"
         );
+    }
+
+    #[test]
+    fn timed_out_probe_is_abandoned() {
+        use crate::bwe_::{ProbeClusterConfig, ProbeKind};
+        use crate::rtp_::Bitrate;
+
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::kbps(500));
+
+        let config = ProbeClusterConfig::new(7.into(), Bitrate::kbps(500), ProbeKind::Exponential);
+        pacer.start_probe(config);
+        assert_eq!(pacer.active_cluster(), Some(7.into()));
+
+        // A sent packet starts the cluster's clock.
+        pacer.register_send(now, DataSize::bytes(1200), MidRid(Mid::from("001"), None));
+
+        // Not timed out yet.
+        assert_eq!(pacer.check_probe_timeout(now + duration_ms(500)), None);
+        assert_eq!(pacer.active_cluster(), Some(7.into()));
+
+        // After the maximum cluster duration the probe is abandoned and the
+        // pacer leaves probe mode.
+        assert_eq!(
+            pacer.check_probe_timeout(now + duration_ms(1500)),
+            Some(7.into())
+        );
+        assert_eq!(pacer.active_cluster(), None);
     }
 
     #[test]

@@ -98,6 +98,15 @@ pub enum Step {
         description: &'static str,
         at_least: Bitrate,
     },
+    /// Check the highest BWE estimate seen since the last event offset update.
+    ///
+    /// Use on lossy/jittery links where the estimate oscillates: sampling the
+    /// latest value at one instant is a lottery on where in the oscillation
+    /// the run happens to end.
+    CheckPeak {
+        description: &'static str,
+        at_least: Bitrate,
+    },
     CheckProbe {
         description: &'static str,
         check: Arc<dyn Fn(usize, &ProbeClusterConfig) -> bool>,
@@ -206,6 +215,40 @@ impl BweTestContext {
                         *at_least
                     );
                     // Check does not reset event offset.
+                }
+                Step::CheckPeak {
+                    description,
+                    at_least,
+                } => {
+                    let peak = l.events[event_offset..]
+                        .iter()
+                        .filter_map(|(_, e)| {
+                            if let Event::EgressBitrateEstimate(BweKind::Twcc(bitrate)) = e {
+                                Some(*bitrate)
+                            } else {
+                                None
+                            }
+                        })
+                        .max_by(|a, b| a.partial_cmp(b).unwrap());
+                    let peak = peak.expect("a BWE estimate");
+
+                    info!(
+                        "{}/{}: Check peak estimate: {} ({} >= {})",
+                        no + 1,
+                        total,
+                        description,
+                        peak,
+                        *at_least
+                    );
+
+                    assert!(
+                        peak >= *at_least,
+                        "Step {} peak estimate {} should be at least {}",
+                        no + 1,
+                        peak,
+                        *at_least
+                    );
+                    // CheckPeak does not reset event offset.
                 }
                 Step::CheckProbe { description, check } => {
                     info!("{}/{}: Check probe: {}", no + 1, total, description);

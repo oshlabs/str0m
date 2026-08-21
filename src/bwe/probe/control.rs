@@ -87,6 +87,7 @@ pub struct ProbeControl {
 struct LastProbe {
     when: Instant,
     kind: ProbeKind,
+    cluster: TwccClusterId,
     further: Bitrate,
     was_estimate: Option<Bitrate>,
 }
@@ -556,9 +557,28 @@ impl ProbeControl {
         self.last_probe = Some(LastProbe {
             when: now,
             kind,
+            cluster: cluster_id,
             further: probe_further,
             was_estimate: self.last_estimate,
         });
+    }
+
+    /// A probe cluster failed on the send side (timed out in the pacer without
+    /// completing). It will never produce an estimate, so it must not gate
+    /// further probing: `maybe_exponential` would otherwise wait forever for
+    /// the estimate to reach 70% of a probe rate that was never actually sent.
+    pub fn probe_timed_out(&mut self, cluster_id: TwccClusterId) {
+        let Some(last) = &mut self.last_probe else {
+            return;
+        };
+
+        if last.cluster != cluster_id {
+            return;
+        }
+
+        // Treat the probe as unanswered rather than answered-low: exponential
+        // probing may retry from the current estimate on its normal schedule.
+        last.further = Bitrate::ZERO;
     }
 
     fn compute_next_timeout(&mut self, now: Instant) -> Instant {
@@ -937,6 +957,35 @@ mod test {
             probe.is_some(),
             "Should trigger allocation probe when desired increases in ALR"
         );
+    }
+
+    #[test]
+    fn timed_out_probe_does_not_wedge_exponential_probing() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(50));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+
+        // Drain initial probes (3x and 6x the estimate).
+        let _ = pc.handle_timeout(now).unwrap();
+        let p2 = pc.handle_timeout(now).unwrap();
+
+        // The last probe's cluster fails on the send side. Without the
+        // failure signal, maybe_exponential waits forever for the estimate to
+        // reach 70% of the failed probe's rate (4.2 Mbps) - which never
+        // happens, since the probe was never actually sent.
+        pc.probe_timed_out(p2.cluster());
+
+        // On the next cycle after the waiting period, exponential probing
+        // retries from the current estimate.
+        let probe = pc.handle_timeout(now + Duration::from_secs(2));
+        assert!(
+            probe.is_some(),
+            "Exponential probing should retry after a failed cluster"
+        );
+        assert_eq!(probe.unwrap().target_bitrate(), Bitrate::mbps(2));
     }
 
     #[test]

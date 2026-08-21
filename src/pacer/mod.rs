@@ -46,6 +46,13 @@ impl PacerImpl {
             PacerImpl::LeakyBucket(v) => v.check_probe_complete(now),
         }
     }
+
+    pub fn check_probe_timeout(&mut self, now: Instant) -> Option<TwccClusterId> {
+        match self {
+            PacerImpl::Null(_) => None,
+            PacerImpl::LeakyBucket(v) => v.check_probe_timeout(now),
+        }
+    }
 }
 
 impl Pacer for PacerImpl {

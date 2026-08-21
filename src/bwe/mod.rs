@@ -41,6 +41,8 @@ use macros::log_loss;
 use smoother::EstimateSmoother;
 
 pub(crate) use macros::{log_pacer_media_debt, log_pacer_padding_debt};
+#[cfg(test)]
+pub(crate) use probe::ProbeKind;
 pub(crate) use probe::{BandwidthLimitedCause, ProbeEstimator};
 pub(crate) use probe::{ProbeClusterState, ProbeControl};
 
@@ -83,6 +85,10 @@ impl Bwe {
 
     pub fn end_probe(&mut self, now: Instant, cluster_id: TwccClusterId) {
         self.bwe.end_probe(now, cluster_id);
+    }
+
+    pub fn probe_timed_out(&mut self, now: Instant, cluster_id: TwccClusterId) {
+        self.bwe.probe_timed_out(now, cluster_id);
     }
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
@@ -399,6 +405,15 @@ impl SendSideBandwidthEstimator {
     /// to allow late-arriving TWCC reports to refine the estimate.
     pub fn end_probe(&mut self, now: Instant, cluster_id: TwccClusterId) {
         self.probe_estimator.end_probe(now, cluster_id);
+    }
+
+    /// A probe cluster was abandoned by the pacer (timed out on the send side).
+    ///
+    /// The estimator finalizes whatever feedback did arrive; the probe
+    /// controller stops treating the cluster as an answerable probe.
+    pub fn probe_timed_out(&mut self, now: Instant, cluster_id: TwccClusterId) {
+        self.probe_estimator.end_probe(now, cluster_id);
+        self.probe_control.probe_timed_out(cluster_id);
     }
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {

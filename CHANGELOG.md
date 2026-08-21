@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Complete probe clusters at low bitrates and abandon clusters that cannot complete
   * Reset the probe stagnation clock only on significant (>5%) estimate changes
   * Seed remote PTs from the codec config in `DirectApi::declare_media` so direct-API medias count as active
 

@@ -9,7 +9,20 @@ use std::time::{Duration, Instant};
 use crate::rtp_::{Bitrate, DataSize, TwccClusterId};
 use crate::util::{already_happened, not_happening};
 
-const MAX_PADDING_PACKET_SIZE: DataSize = DataSize::bytes(240);
+/// Preferred size of a probe padding burst, toward a typical MTU.
+///
+/// Padding requests of this size let the padding generator use spurious resends
+/// (full-size RTX packets from the cache). Smaller requests fall back to blank
+/// padding packets, which the RTP padding format caps at 255 bytes - at low
+/// probe bitrates such crumbs cannot satisfy a cluster's minimum packet count
+/// within its byte budget.
+const PROBE_BURST_TARGET_SIZE: DataSize = DataSize::bytes(1200);
+
+/// The longest a probe cluster may take on the send side before it is
+/// abandoned. Matches the receive-side estimator's `MAX_PROBE_INTERVAL`
+/// (WebRTC's `kMaxProbeInterval`): a cluster stretched longer than this can
+/// no longer produce a valid estimate.
+pub(crate) const MAX_PROBE_CLUSTER_DURATION: Duration = Duration::from_secs(1);
 
 /// Configuration for a probe cluster (the plan).
 ///
@@ -263,32 +276,70 @@ impl ProbeClusterState {
             return None;
         }
 
+        // The cluster is only complete when BOTH the byte target and the minimum
+        // packet count are met (see `is_complete`). The byte target is a floor
+        // derived from target_bitrate * target_duration, not a ceiling: keep
+        // generating padding until both criteria can be satisfied. Capping
+        // generation at the byte target would wedge low-bitrate clusters
+        // forever, since their byte budget fills before the packet count.
+        let bytes_remaining = self.config.target_bytes().saturating_sub(self.bytes_sent);
+        let packets_remaining = self
+            .config
+            .min_packet_count()
+            .saturating_sub(self.packets_sent);
+
+        if bytes_remaining == DataSize::ZERO && packets_remaining == 0 {
+            return None;
+        }
+
         // Mark that we've created padding for this instant
         self.last_padding_at = now;
 
         // It's time to send a new probe burst.
         // Calculate recommended probe size as target_bitrate * min_probe_delta.
         let min_delta = self.config.min_probe_delta();
-        let recommended_probe_size = self.config.target_bitrate * min_delta;
+        let rate_burst = self.config.target_bitrate * min_delta;
 
-        // Ensure we request at least one padding packet worth of bytes even if min_delta is 0.
-        let recommended_probe_size = DataSize::bytes(cmp::max(
-            recommended_probe_size.as_bytes_i64(),
-            MAX_PADDING_PACKET_SIZE.as_bytes_i64(),
+        // Size bursts toward the MTU (see PROBE_BURST_TARGET_SIZE), but never so
+        // large that the minimum packet count of bursts, paced at the target
+        // bitrate, would stretch the cluster past the estimator's maximum valid
+        // probe interval.
+        let packets_for_interval = (self.config.min_packet_count() + 1).max(1) as u32;
+        let interval_bound =
+            self.config.target_bitrate * (MAX_PROBE_CLUSTER_DURATION / packets_for_interval);
+        let burst = DataSize::bytes(cmp::max(
+            rate_burst.as_bytes_i64(),
+            cmp::min(
+                PROBE_BURST_TARGET_SIZE.as_bytes_i64(),
+                interval_bound.as_bytes_i64(),
+            ),
         ));
 
-        // Calculate remaining bytes needed to complete the probe cluster.
-        let bytes_remaining = self.config.target_bytes().saturating_sub(self.bytes_sent);
-
-        // Return the minimum of bytes_remaining and recommended_probe_size.
-        // When bytes_remaining is zero, this returns None (no more padding).
-        let request_bytes = cmp::min(bytes_remaining, recommended_probe_size);
+        // When only bytes are missing, don't overshoot the byte target.
+        let request_bytes = if packets_remaining > 0 {
+            burst
+        } else {
+            cmp::min(bytes_remaining, burst)
+        };
 
         if request_bytes == DataSize::ZERO {
             None
         } else {
             Some(request_bytes)
         }
+    }
+
+    /// Check if this probe cluster has been going on for too long to ever
+    /// produce a valid estimate. Such a cluster must be abandoned: it would
+    /// otherwise occupy the pacer's probe queue forever (probes are only
+    /// dequeued on completion) and leave the probe controller waiting for an
+    /// answer that never comes.
+    pub fn is_timed_out(&self, now: Instant) -> bool {
+        let Some(started_at) = self.started_at else {
+            return false;
+        };
+
+        now.saturating_duration_since(started_at) > MAX_PROBE_CLUSTER_DURATION
     }
 
     /// Record a packet that was sent as part of this probe (media or padding).
@@ -408,6 +459,71 @@ mod test {
         state.test_set_state(DataSize::bytes(2200), 2, now + Duration::from_millis(1));
         assert_eq!(state.bytes_sent, DataSize::bytes(2200));
         assert_eq!(state.packets_sent, 2);
+    }
+
+    #[test]
+    fn low_bitrate_cluster_completes_via_min_packet_count() {
+        let now = Instant::now();
+        // 100 kbps * 15ms = 187 bytes target - far less than 5 padding packets.
+        // The byte target is a floor, not a ceiling: padding generation must
+        // continue until the packet count is also met.
+        let config = ProbeClusterConfig::new(1.into(), Bitrate::kbps(100), ProbeKind::Initial);
+        let mut state = ProbeClusterState::new(config);
+
+        let mut t = now;
+        for _ in 0..20 {
+            if state.is_complete(t) {
+                break;
+            }
+            if let Some(size) = state.next_packet(t) {
+                state.record_packet(t, size);
+            }
+            let next = state.next_probe_time().max(t + config.min_probe_delta());
+            t = next;
+        }
+
+        assert!(
+            state.is_complete(t),
+            "low-bitrate cluster must complete: {} packets, {:?} bytes",
+            state.packets_sent,
+            state.bytes_sent
+        );
+        assert!(state.packets_sent >= config.min_packet_count());
+    }
+
+    #[test]
+    fn probe_padding_bursts_sized_toward_mtu() {
+        let now = Instant::now();
+        // At 500 kbps, rate * min_probe_delta is only 125 bytes. Padding
+        // requests that small are served as blank padding packets (capped at
+        // 255 bytes by the RTP padding format) instead of full-size spurious
+        // resends, so the burst must be sized toward the MTU.
+        let config = ProbeClusterConfig::new(1.into(), Bitrate::kbps(500), ProbeKind::Initial);
+        let mut state = ProbeClusterState::new(config);
+
+        let burst = state.next_packet(now).expect("a first burst");
+
+        assert!(
+            burst >= DataSize::bytes(1200),
+            "probe burst should be MTU-sized, got {:?}",
+            burst
+        );
+    }
+
+    #[test]
+    fn stalled_cluster_times_out() {
+        let now = Instant::now();
+        let config = ProbeClusterConfig::new(1.into(), Bitrate::mbps(3), ProbeKind::Initial);
+        let mut state = ProbeClusterState::new(config);
+
+        // Not started: no timeout.
+        assert!(!state.is_timed_out(now + Duration::from_secs(10)));
+
+        state.record_packet(now, DataSize::bytes(1200));
+
+        assert!(!state.is_timed_out(now + Duration::from_millis(500)));
+        assert!(state.is_timed_out(now + Duration::from_millis(1100)));
+        assert!(!state.is_complete(now + Duration::from_millis(1100)));
     }
 
     #[test]
