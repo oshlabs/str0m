@@ -43,6 +43,9 @@ const ESTIMATE_CHANGE_THRESHOLD: f64 = 0.05;
 /// Probe rate scale for stagnation probes (2× current estimate).
 const STAGNANT_PROBE_SCALE: f64 = 2.0;
 
+/// Probe rate scale for unmet-desired probes (2× current estimate ceiling).
+const UNMET_DESIRED_PROBE_SCALE: f64 = 2.0;
+
 /// WebRTC's `BandwidthLimitedCause` (subset used by probing gating).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BandwidthLimitedCause {
@@ -80,6 +83,7 @@ pub struct ProbeControl {
 
     scheduled_exponential: Option<Instant>,
     scheduled_periodic_alr: Option<Instant>,
+    scheduled_unmet_desired: Option<Instant>,
     scheduled_stagnant: Option<Instant>,
 }
 
@@ -118,6 +122,7 @@ impl Default for ProbeControl {
             pending: VecDeque::new(),
             scheduled_exponential: None,
             scheduled_periodic_alr: None,
+            scheduled_unmet_desired: None,
             scheduled_stagnant: None,
         }
     }
@@ -143,6 +148,7 @@ impl ProbeControl {
             self.prev_estimate = None;
             self.scheduled_exponential = None;
             self.scheduled_periodic_alr = None;
+            self.scheduled_unmet_desired = None;
             self.scheduled_stagnant = None;
             self.next_timeout = not_happening();
         }
@@ -201,6 +207,7 @@ impl ProbeControl {
         self.next_timeout = already_happened();
         self.scheduled_exponential = None;
         self.scheduled_periodic_alr = None;
+        self.scheduled_unmet_desired = None;
         self.scheduled_stagnant = None;
     }
 
@@ -244,6 +251,7 @@ impl ProbeControl {
             || self.maybe_exponential(now, desired, estimate)
             || self.maybe_increase_alr(now, desired, estimate)
             || self.maybe_large_drop(now, desired, estimate)
+            || self.maybe_unmet_desired(now, desired, estimate)
             || self.maybe_periodic_alr(now, desired)
             || self.maybe_stagnant(now, desired, estimate);
 
@@ -486,6 +494,60 @@ impl ProbeControl {
         true
     }
 
+    /// Probe toward an unmet desired bitrate outside ALR.
+    ///
+    /// ## Why This Exists (str0m Addition)
+    ///
+    /// WebRTC's allocation probes (`maybe_increase_alr`) only fire in ALR,
+    /// on the assumption that a sender wanting more bandwidth is sending
+    /// less than it could (application-limited). That assumption fails for
+    /// a constant-rate sender such as an SFU forwarding fixed-rate
+    /// simulcast layers: the delay estimator ceilings the estimate at
+    /// ~1.5x the acked rate, so utilization floors at ~67% - just above
+    /// the ~65% ALR threshold. ALR never triggers, allocation and periodic
+    /// probes never fire, and the estimate can never climb toward a
+    /// desired rate the application cannot start sending until the
+    /// estimate allows it (a chicken-and-egg: the next simulcast layer up
+    /// costs ~2x, but the ceiling grants at most ~1.5x).
+    ///
+    /// This probe fires while `desired > estimate` outside ALR, at the
+    /// same cadence as periodic ALR probing, targeting
+    /// min(2x estimate, desired plus the probe uncertainty margin). It is
+    /// suppressed in the bandwidth-limited states `can_probe` already
+    /// guards, so it never probes into active congestion. Once the
+    /// estimate covers the desired rate the condition closes and probing
+    /// stops.
+    fn maybe_unmet_desired(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
+        // Don't interfere with initial probing phase.
+        if self.is_during_initial(now) {
+            return false;
+        }
+
+        // In ALR, allocation and periodic ALR probes handle this regime.
+        if self.in_alr() {
+            return false;
+        }
+
+        // Only while the application wants more than the estimate provides.
+        if desired <= estimate {
+            return false;
+        }
+
+        // Same cadence as periodic ALR probing.
+        if self.time_since_last_probe(now) < MIN_TIME_BETWEEN_ALR_PROBES {
+            return false;
+        }
+
+        // Conservative target: at most doubling the estimate, and no further
+        // than the desired rate (plus uncertainty, so a successful probe can
+        // prove the desired rate itself).
+        let cap = desired * (1.0 + PROBE_UNCERTAINTY);
+        let target = (estimate * UNMET_DESIRED_PROBE_SCALE).min(cap);
+        self.queue_probe(target, ProbeKind::UnmetDesired, desired, now);
+
+        true
+    }
+
     fn maybe_large_drop(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
@@ -599,6 +661,24 @@ impl ProbeControl {
                 self.scheduled_periodic_alr = Some(now + MIN_TIME_BETWEEN_ALR_PROBES);
             }
             return self.scheduled_periodic_alr.unwrap();
+        }
+
+        // Unmet-desired probing (only when not in ALR, while desired > estimate)
+        let desired_unmet = match (self.desired_bitrate, self.last_estimate) {
+            (Some(desired), Some(estimate)) => desired > estimate,
+            _ => false,
+        };
+        if !self.in_alr() && desired_unmet {
+            if self.scheduled_unmet_desired.is_none() {
+                // Anchor at the last probe so the cadence is relative to
+                // probes, not to whenever this timeout happened to run.
+                let eligible_at = self
+                    .last_when()
+                    .map(|t| t + MIN_TIME_BETWEEN_ALR_PROBES)
+                    .unwrap_or(now);
+                self.scheduled_unmet_desired = Some(eligible_at.max(now));
+            }
+            return self.scheduled_unmet_desired.unwrap();
         }
 
         // Stagnant probing (only when not in ALR)
@@ -989,6 +1069,90 @@ mod test {
     }
 
     #[test]
+    fn unmet_desired_probe_fires_outside_alr() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+
+        // Drain initial probes.
+        let _ = pc.handle_timeout(now).unwrap();
+        let _ = pc.handle_timeout(now).unwrap();
+
+        // Rate limited: same cadence as periodic ALR probes.
+        assert!(pc.handle_timeout(now + Duration::from_secs(2)).is_none());
+
+        // Outside ALR with desired > estimate, the unmet-desired probe fires,
+        // capped at 2x the estimate.
+        let probe = pc.handle_timeout(now + Duration::from_secs(6));
+        let probe = probe.expect("unmet-desired probe outside ALR");
+        assert_eq!(probe.target_bitrate(), Bitrate::mbps(2));
+        assert!(!probe.is_alr_probe());
+
+        // Still rate limited relative to the probe that just fired.
+        assert!(pc.handle_timeout(now + Duration::from_secs(8)).is_none());
+
+        // And fires again once the interval has passed, as long as desired
+        // stays unmet.
+        let again = pc.handle_timeout(now + Duration::from_secs(12));
+        assert!(again.is_some(), "repeats while desired remains unmet");
+    }
+
+    #[test]
+    fn unmet_desired_probe_stops_when_desired_is_met() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+
+        let _ = pc.handle_timeout(now).unwrap();
+        let _ = pc.handle_timeout(now).unwrap();
+
+        // The desired rate is now within the estimate: no probe.
+        pc.set_desired_bitrate(Bitrate::kbps(800));
+        assert!(pc.handle_timeout(now + Duration::from_secs(6)).is_none());
+    }
+
+    #[test]
+    fn unmet_desired_probe_suppressed_during_congestion() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+
+        let _ = pc.handle_timeout(now).unwrap();
+        let _ = pc.handle_timeout(now).unwrap();
+
+        // Loss-limited (decreasing): can_probe gates all probing.
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::LossLimitedBwe);
+        assert!(pc.handle_timeout(now + Duration::from_secs(6)).is_none());
+    }
+
+    #[test]
+    fn periodic_alr_probe_takes_precedence_in_alr() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+
+        let _ = pc.handle_timeout(now).unwrap();
+        let _ = pc.handle_timeout(now).unwrap();
+
+        // In ALR, the ALR machinery owns this regime.
+        pc.set_alr_start_time(now + Duration::from_secs(2));
+        let probe = pc.handle_timeout(now + Duration::from_secs(6));
+        assert!(probe.unwrap().is_alr_probe());
+    }
+
+    #[test]
     fn stagnant_probe_not_deferred_by_insignificant_estimate_change() {
         let mut pc = ProbeControl::new();
         pc.enable(true);
@@ -1007,12 +1171,16 @@ mod test {
             Bitrate::kbps(1_020),
             BandwidthLimitedCause::LossLimitedBweIncreasing,
         );
-        assert!(pc.handle_timeout(now + Duration::from_secs(10)).is_none());
+
+        // An unmet-desired probe fires on its own cadence; it does not read
+        // the stagnation clock.
+        assert!(pc.handle_timeout(now + Duration::from_secs(12)).is_some());
 
         // 16 seconds after the baseline the estimate has been stagnant for
-        // more than 15 seconds despite unmet demand: the stagnation probe
-        // must fire. With an exact-inequality change check, the 2% movement
-        // at +10s would have reset the clock and deferred this probe.
+        // more than 15 seconds despite unmet demand. The unmet-desired probe
+        // is rate limited (a probe fired 4 seconds ago), so the stagnation
+        // probe is the one that must fire. With an exact-inequality change
+        // check, the 2% movement would have reset the clock and deferred it.
         let probe = pc.handle_timeout(now + Duration::from_secs(16));
         assert!(
             probe.is_some(),
