@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Seed remote PTs from the codec config in `DirectApi::declare_media` so direct-API medias count as active
+
 # 0.23.1
 
   * Guard SRTP/SRTCP and RTCP parsing against malformed input #1029

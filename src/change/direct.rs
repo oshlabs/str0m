@@ -9,7 +9,7 @@ use crate::crypto::Fingerprint;
 use crate::crypto::dtls::ProtocolVersion;
 use crate::media::{Media, MediaKind};
 use crate::rtp_::MidRid;
-use crate::rtp_::{Mid, Rid, Ssrc};
+use crate::rtp_::{Mid, Pt, Rid, Ssrc};
 use crate::sctp::{ChannelConfig, SctpInitData};
 use crate::streams::{DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP, StreamRx, StreamTx};
 
@@ -224,7 +224,22 @@ impl<'a> DirectApi<'a> {
         };
 
         let exts = self.rtc.session.exts.cloned_with_type(kind.is_audio());
-        let m = Media::from_direct_api(mid, next_index, kind, exts);
+
+        // In direct mode there is no SDP OFFER/ANSWER to narrow the payload types;
+        // the application's codec config is the negotiation. Seed the remote PTs
+        // from it so the media doesn't read as disabled ("no codecs matched"),
+        // which would make `has_active_outgoing_media()` false and zero the
+        // pacer's padding rate, starving BWE probing.
+        let remote_pts: Vec<Pt> = self
+            .rtc
+            .session
+            .codec_config
+            .all_for_kind(kind)
+            .map(|p| p.pt())
+            .collect();
+
+        let mut m = Media::from_direct_api(mid, next_index, kind, exts);
+        m.set_remote_pts(remote_pts);
 
         self.rtc.session.medias.push(m);
         self.rtc.session.medias.last_mut().unwrap()

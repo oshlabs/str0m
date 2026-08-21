@@ -73,6 +73,10 @@ pub fn bwe_cellular() -> Result<(), RtcError> {
         description: "Wait for mid",
         duration: Duration::from_secs(40),
     };
+    plan[5] = Step::Run {
+        description: "Wait for top",
+        duration: Duration::from_secs(40),
+    };
 
     let (mut l, mut r) = connect_with_bwe(LAYER_LOW, LAYER_MID);
 
