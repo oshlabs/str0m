@@ -262,9 +262,15 @@ impl ProbeControl {
     }
 
     fn update_estimate_change(&mut self, now: Instant, estimate: Bitrate) {
-        // Track when estimate last changed significantly (>5%).
+        // Track when estimate last changed significantly (>5%). An exact
+        // inequality check here would let insignificant movements (e.g. a
+        // sub-5% estimate accepted because the bandwidth-limited cause
+        // changed) perpetually reset the stagnation clock, deferring
+        // `maybe_stagnant` indefinitely.
         if let Some(prev) = self.prev_estimate {
-            if estimate != prev {
+            let upper = prev * (1.0 + ESTIMATE_CHANGE_THRESHOLD);
+            let lower = prev * (1.0 - ESTIMATE_CHANGE_THRESHOLD);
+            if estimate > upper || estimate < lower {
                 self.last_estimate_change = Some(now);
             }
         }
@@ -930,6 +936,38 @@ mod test {
         assert!(
             probe.is_some(),
             "Should trigger allocation probe when desired increases in ALR"
+        );
+    }
+
+    #[test]
+    fn stagnant_probe_not_deferred_by_insignificant_estimate_change() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+
+        // Drain initial probes.
+        let _ = pc.handle_timeout(now).unwrap();
+        let _ = pc.handle_timeout(now).unwrap();
+
+        // A sub-5% estimate movement is accepted because the cause changed.
+        // It must not count as a significant change for stagnation tracking.
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(1_020),
+            BandwidthLimitedCause::LossLimitedBweIncreasing,
+        );
+        assert!(pc.handle_timeout(now + Duration::from_secs(10)).is_none());
+
+        // 16 seconds after the baseline the estimate has been stagnant for
+        // more than 15 seconds despite unmet demand: the stagnation probe
+        // must fire. With an exact-inequality change check, the 2% movement
+        // at +10s would have reset the clock and deferred this probe.
+        let probe = pc.handle_timeout(now + Duration::from_secs(16));
+        assert!(
+            probe.is_some(),
+            "Stagnant probe should fire despite an insignificant estimate change"
         );
     }
 
