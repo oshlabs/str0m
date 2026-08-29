@@ -6,12 +6,34 @@ use crate::Rtc;
 use crate::RtcError;
 use crate::channel::ChannelId;
 use crate::crypto::Fingerprint;
-use crate::crypto::dtls::ProtocolVersion;
+use crate::crypto::dtls::{ProtocolVersion, SrtpProfile};
 use crate::media::{Media, MediaKind};
 use crate::rtp_::MidRid;
 use crate::rtp_::{Mid, Pt, Rid, Ssrc};
 use crate::sctp::{ChannelConfig, SctpInitData};
 use crate::streams::{DEFAULT_RTX_CACHE_DURATION, DEFAULT_RTX_RATIO_CAP, StreamRx, StreamTx};
+
+/// The DTLS-SRTP keying material of a connected session, as exported by
+/// the DTLS handshake (RFC 5764 §4.2): the raw exporter output, the
+/// negotiated SRTP protection profile, and whether this side was the
+/// DTLS client (`active`). The client/server halves of the material are
+/// split per the profile's key and salt lengths; which half protects
+/// this side's sending direction follows from `active`.
+///
+/// Intended for external tooling that needs to decrypt a capture of this
+/// session (a debugging trace with embedded key material, a test oracle).
+/// It is the same material str0m derives its own SRTP contexts from —
+/// treat it as a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrtpKeyingMaterial {
+    /// The exporter output, `2 * (key_len + salt_len)` bytes for the
+    /// profile: client key, server key, client salt, server salt.
+    pub material: Vec<u8>,
+    /// The negotiated profile.
+    pub profile: SrtpProfile,
+    /// `true` when this side was the DTLS client (active).
+    pub active: bool,
+}
 
 /// Direct change strategy.
 ///
@@ -45,6 +67,16 @@ impl<'a> DirectApi<'a> {
     /// and the `Rtc` instance provides low-level access to the underlying WebRTC functionality.
     pub fn new(rtc: &'a mut Rtc) -> Self {
         DirectApi { rtc }
+    }
+
+    /// The DTLS-SRTP keying material once the DTLS handshake has completed,
+    /// `None` before that (and on a session that never negotiated SRTP).
+    ///
+    /// The material is retained from the handshake for the life of the
+    /// session, so this works at any later point too — not only at the
+    /// moment of [`Event::Connected`][crate::Event::Connected].
+    pub fn srtp_keying_material(&self) -> Option<&SrtpKeyingMaterial> {
+        self.rtc.srtp_keying.as_ref()
     }
 
     /// Sets the ICE controlling flag for this peer connection.

@@ -905,6 +905,9 @@ pub struct Rtc {
     ice: IceAgent,
     dtls: Dtls,
     dtls_connected: bool,
+    /// The DTLS-SRTP keying material, retained for
+    /// [`DirectApi::srtp_keying_material`][change::DirectApi::srtp_keying_material].
+    srtp_keying: Option<change::SrtpKeyingMaterial>,
     dtls_buf: Vec<u8>,
     next_dtls_timeout: Option<Instant>,
     sctp: RtcSctp,
@@ -1270,6 +1273,7 @@ impl Rtc {
             )
             .expect("DTLS to init without problem"),
             dtls_connected: false,
+            srtp_keying: None,
             dtls_buf: vec![0; 2000],
             next_dtls_timeout: None,
             session,
@@ -1650,6 +1654,11 @@ impl Rtc {
                     let km_bytes = km.as_ref().to_vec();
                     debug!("DTLS set SRTP keying material and profile: {}", profile);
                     let active = self.dtls.is_active().expect("DTLS must be inited by now");
+                    self.srtp_keying = Some(change::SrtpKeyingMaterial {
+                        material: km_bytes.clone(),
+                        profile,
+                        active,
+                    });
                     self.session.set_keying_material(
                         KeyingMaterial::new(&km_bytes),
                         &self.crypto_provider,

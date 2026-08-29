@@ -788,6 +788,21 @@ impl StreamRx {
         self.register_rtx = None;
     }
 
+    /// The highest extended sequence number received on the main stream,
+    /// `None` until the first packet. Its [`SeqNo::roc`] is the rollover
+    /// counter SRTP decryption of this stream is at — what an external
+    /// decryptor of a capture needs to pick up mid-stream.
+    pub fn max_seq_no(&self) -> Option<SeqNo> {
+        self.register.as_ref().and_then(|r| r.max_seq())
+    }
+
+    /// The highest extended sequence number received on the RTX (repair)
+    /// stream — its own SRTP stream under the repair SSRC. `None` until
+    /// the first repair packet.
+    pub fn rtx_max_seq_no(&self) -> Option<SeqNo> {
+        self.register_rtx.as_ref().and_then(|r| r.max_seq())
+    }
+
     /// Reset the current rollover counter (ROC).
     ///
     /// This is used in scenarios where we use a single sequence number across all

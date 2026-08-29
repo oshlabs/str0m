@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Add `DirectApi::srtp_keying_material` and per-stream extended sequence number getters (`StreamRx::max_seq_no`, `StreamTx::last_sent_seq_no` and the RTX siblings) so external tooling can decrypt a capture of the session
   * Cover packets dropped between consecutive TWCC reports so the sender can count them as lost
   * Probe toward an unmet desired bitrate outside ALR so constant-rate senders can discover recovered capacity
   * Stop bounding loss controller candidates by the delay-based estimate, which deadlocked BWE recovery

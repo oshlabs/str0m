@@ -112,6 +112,9 @@ pub struct StreamTx {
     /// direct RTP mode writing.
     last_sent_seq_no: SeqNo,
 
+    /// Whether `last_sent_seq_no` has been set by an actual send.
+    last_sent_seq_no_valid: bool,
+
     /// When we last sent something for this encoded stream, packet or RTCP.
     last_used: Instant,
 
@@ -315,6 +318,7 @@ impl StreamTx {
             seq_no: SeqNo::default(),
             seq_no_rtx: SeqNo::default(),
             last_sent_seq_no: SeqNo::default(),
+            last_sent_seq_no_valid: false,
             last_used: already_happened(),
             rtp_and_wallclock: None,
             send_queue: SendQueue::new(),
@@ -401,6 +405,21 @@ impl StreamTx {
             self.stats.bytes_retransmitted = None;
         }
         self.rtx_ratio_cap = rtx_ratio_cap;
+    }
+
+    /// The extended sequence number of the last packet sent on the main
+    /// stream (both RTP-mode writes and media-API packetization), or
+    /// `None` before the first. Its [`SeqNo::roc`] is the rollover counter
+    /// an external decryptor of a capture of this stream needs.
+    pub fn last_sent_seq_no(&self) -> Option<SeqNo> {
+        self.last_sent_seq_no_valid.then_some(self.last_sent_seq_no)
+    }
+
+    /// The extended sequence number the next RTX (repair) packet will
+    /// carry — the repair stream's own SRTP sequence space under the
+    /// repair SSRC. Zero until the first resend.
+    pub fn next_rtx_seq_no(&self) -> SeqNo {
+        self.seq_no_rtx
     }
 
     /// Set whether this stream is unpaced or not.
@@ -691,6 +710,7 @@ impl StreamTx {
         let seq_no = next.seq_no;
         if next.kind == NextPacketKind::Regular {
             self.last_sent_seq_no = seq_no;
+            self.last_sent_seq_no_valid = true;
         }
 
         self.last_used = now;
