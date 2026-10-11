@@ -88,8 +88,12 @@ impl Bwe {
         self.bwe.probe_timed_out(now, cluster_id);
     }
 
+    /// Start the estimator over at `init_bitrate`, and the smoother with
+    /// it: the next estimate the application sees is the seed itself, not
+    /// the seed averaged with the window the old estimator left behind.
     pub fn reset(&mut self, init_bitrate: Bitrate) {
         self.bwe.reset(init_bitrate);
+        self.smoother = EstimateSmoother::new();
     }
 
     pub fn update<'t>(
@@ -480,5 +484,36 @@ impl fmt::Display for BandwidthUsage {
             BandwidthUsage::Normal => write!(f, "normal"),
             BandwidthUsage::Underuse => write!(f, "underuse"),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `reset` is what an application calls when the estimate it trained
+    /// is known to be wrong for what comes next (an audio-only phase's
+    /// tiny estimate before video starts). The smoother used to survive
+    /// the reset with its window intact, so the first emission after it
+    /// was the average of the stale window and the seed, and the seed
+    /// alone surfaced only once the window had aged out (3 s) or feedback
+    /// moved the estimator. The wrong assumption: a reset estimator and a
+    /// smoother over its history are two independent things.
+    #[test]
+    fn reset_emits_the_seed_itself_on_the_next_poll() {
+        let t0 = Instant::now();
+        let mut bwe = Bwe::new(Bitrate::kbps(1000));
+        bwe.handle_timeout(t0, false);
+        assert_eq!(bwe.poll_estimate(), Some(Bitrate::kbps(1000)));
+        bwe.handle_timeout(t0 + Duration::from_millis(100), false);
+        assert_eq!(bwe.poll_estimate(), None, "nothing new");
+
+        bwe.reset(Bitrate::kbps(300));
+        bwe.handle_timeout(t0 + Duration::from_millis(200), false);
+        assert_eq!(
+            bwe.poll_estimate(),
+            Some(Bitrate::kbps(300)),
+            "the seed, not its average with the old window"
+        );
     }
 }
