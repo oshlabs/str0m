@@ -216,6 +216,21 @@ impl<'a> DirectApi<'a> {
         self.rtc.ice.set_ice_lite(ice_lite);
     }
 
+    /// Re-create every candidate pair from the current local and remote
+    /// candidates and resume connectivity checks on them.
+    ///
+    /// The ICE agent removes a pair whose checks go unanswered, and once
+    /// every pair is gone it reports `Disconnected` and sends nothing
+    /// more: recovery then depends on the remote peer's next binding
+    /// request. A server that wants to find a peer again after an
+    /// outage — the same credentials on both sides, so no ICE restart —
+    /// calls this while disconnected to probe the known candidates
+    /// itself. The state moves to `Checking`; a pair that answers takes
+    /// it back to `Connected`.
+    pub fn recreate_candidate_pairs(&mut self) {
+        self.rtc.ice.recreate_candidate_pairs();
+    }
+
     /// Enable twcc feedback.
     pub fn enable_twcc_feedback(&mut self) {
         self.rtc.session.enable_twcc_feedback()

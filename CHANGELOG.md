@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Add `DirectApi::recreate_candidate_pairs` so a server can resume connectivity checks toward the candidates it still holds after `Disconnected`, instead of waiting for the peer's next binding request
   * Reset the estimate smoother together with the estimator in `Bwe::reset`, so the first estimate after a reset is the seed rather than its average with the old window
   * Add `DirectApi::srtp_keying_material` and per-stream extended sequence number getters (`StreamRx::max_seq_no`, `StreamTx::last_sent_seq_no` and the RTX siblings) so external tooling can decrypt a capture of the session
   * Cover packets dropped between consecutive TWCC reports so the sender can count them as lost
